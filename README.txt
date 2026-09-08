@@ -78,7 +78,7 @@ Diğer varsayılanlar:
     GEMMA_N_CTX=16384, GEMMA_MAX_TOKENS=2048, GEMMA_TEMPERATURE=0.2
     GEMMA_N_GPU_LAYERS=-1, GEMMA_N_THREADS=0 (otomatik)
     GEMMA_MAX_AGENT_STEPS=15, GEMMA_MAX_UNKNOWN_TOOL_ATTEMPTS=3
-    GEMMA_SHOW_THOUGHTS=0, GEMMA_VERBOSE_LLAMA=0
+    GEMMA_SHOW_THOUGHTS=1, GEMMA_VERBOSE_LLAMA=0
     GEMMA_COMMAND_TIMEOUT_SECONDS=30
     GEMMA_COMMAND_MAX_OUTPUT_CHARS=20000, GEMMA_COMMAND_MAX_LENGTH=4000
     GEMMA_FILE_MAX_BYTES=1048576
@@ -146,9 +146,12 @@ grupları birlikte çıkarılır; ilk görev ve en son grup korunur. Yine sığm
 görev küçültme hatası döner. Gerçek template hesabının son otoritesi llama.cpp'dir.
 Her yeni terminal isteği önceki run geçmişinden bağımsızdır.
 
-Araç logları ad ve durum özetidir. Oturum değerleri ve kimlik doğrulama
-başlıkları maskelenir. Thought gösterimi açıkça etkinleştirilebilir fakat
-varsayılan kapalıdır. Jira/dosya çıktıları talimat değil güvenilmeyen veridir.
+Terminal her istekte adım sayısını, modelin durumunu, seçilen aracın amacını,
+güvenli sonuç özetini ve geçen süreyi gösterir. Modelin thought blokları
+varsayılan olarak görünür; GEMMA_SHOW_THOUGHTS=0 ile kapatılabilir. Thought,
+araç ve hata çıktılarında bilinen oturum değerleri ile kimlik doğrulama
+başlıkları maskelenir. Ham araç sonucu terminale dökülmez. Jira/dosya çıktıları
+talimat değil güvenilmeyen veridir.
 
 GÜVENLİK SINIRI
 --------------
@@ -186,11 +189,12 @@ Windows kabul:
 
 Statik kontroller (Ruff geliştirme aracı; runtime bağımlılığı değildir):
     ruff check .
-    ruff format --check agent.py agent_tools.py config.py settings.py jira_client.py process_runner.py process_worker.py windows_job.py runtime_check.py test_agent.py test_agent_loop.py test_jira.py test_settings.py test_process_runner.py test_tools.py test_runtime_check.py
+    ruff format --check agent.py terminal_ui.py agent_tools.py config.py settings.py jira_client.py process_runner.py process_worker.py windows_job.py runtime_check.py test_agent.py test_agent_loop.py test_jira.py test_settings.py test_process_runner.py test_tools.py test_runtime_check.py
 
 MİMARİ
 ------
 agent.py: CLI, model kurulumu, budget ve tool döngüsü.
+terminal_ui.py: kullanıcı dostu adım, düşünce, araç ve süre sunumu.
 agent_tools.py: dosya/komut araçları, şemalar ve dispatcher.
 gemma_parser.py: mevcut JSON/Gemma ayrıştırıcısı.
 settings.py / config.py: literal .env, maskeleme ve doğrulanmış ayarlar.

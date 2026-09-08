@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from typing import Any, Callable
 
@@ -27,6 +28,7 @@ from gemma_parser import (
     parse_gemma_tool_calls,
 )
 from settings import redact
+from terminal_ui import TerminalUI
 
 SYSTEM_PROMPT = """
 You are a Windows coding assistant with read-only Jira access.
@@ -175,11 +177,15 @@ class OfflineGemmaAgent:
         workspace=WORKSPACE,
         n_ctx: int = N_CTX,
         max_tokens: int = MAX_TOKENS,
+        terminal: TerminalUI | None = None,
+        show_model_thoughts: bool = SHOW_MODEL_THOUGHTS,
     ) -> None:
         self.llm = llm if llm is not None else _build_llm()
         self.tool_executor = tool_executor
         self.workspace = workspace
         self.n_ctx, self.max_tokens = n_ctx, max_tokens
+        self.terminal = terminal or TerminalUI()
+        self.show_model_thoughts = show_model_thoughts
 
     def _messages(self, initial: list[dict], groups: list[list[dict]]) -> list[dict]:
         # Tokenize the full tool schema and serialized history. Reserve additional
@@ -202,14 +208,16 @@ class OfflineGemmaAgent:
     def run(self, user_message: str, max_steps: int = MAX_AGENT_STEPS) -> str:
         if not isinstance(user_message, str) or not user_message.strip():
             raise ValueError("A nonempty user message is required")
+        started_at = time.monotonic()
         invalid_attempts = 0
         initial = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": redact(user_message)},
         ]
         groups: list[list[dict]] = []
+        self.terminal.request_started(max_steps)
         for step in range(1, max_steps + 1):
-            print(f"\n=== STEP {step} ===")
+            self.terminal.step_started(step, max_steps)
             messages = self._messages(initial, groups)
             response = self.llm.create_chat_completion(
                 messages=messages,
@@ -229,6 +237,7 @@ class OfflineGemmaAgent:
                     raise ValueError("Empty model output")
             except (ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError):
                 invalid_attempts += 1
+                self.terminal.invalid_response(invalid_attempts, MAX_UNKNOWN_TOOL_ATTEMPTS)
                 if invalid_attempts >= MAX_UNKNOWN_TOOL_ATTEMPTS:
                     raise RuntimeError(
                         "Stopped after consecutive invalid, incomplete or unavailable tool responses"
@@ -247,45 +256,54 @@ class OfflineGemmaAgent:
                 )
                 continue
             invalid_attempts = 0
-            if SHOW_MODEL_THOUGHTS:
-                for thought in extract_gemma_thoughts(content):
-                    print(redact(thought))
+            if self.show_model_thoughts:
+                thoughts = extract_gemma_thoughts(content)
+                reasoning_content = message.get("reasoning_content")
+                if isinstance(reasoning_content, str) and reasoning_content.strip():
+                    thoughts.append(reasoning_content.strip())
+                self.terminal.model_thoughts(thoughts)
             if not calls:
                 answer = redact(extract_visible_content(content))
-                print("\n=== FINAL ANSWER ===\n" + answer)
+                self.terminal.final_answer(answer, step, time.monotonic() - started_at)
                 return answer
             group = [{"role": "assistant", "content": None, "tool_calls": calls}]
-            for call in calls:
+            self.terminal.tool_plan(len(calls))
+            for index, call in enumerate(calls, start=1):
                 function = call["function"]
+                arguments = json.loads(function["arguments"])
+                self.terminal.tool_started(index, len(calls), function["name"], arguments)
+                tool_started_at = time.monotonic()
                 result = self.tool_executor(
                     name=function["name"],
-                    arguments=json.loads(function["arguments"]),
+                    arguments=arguments,
                     workspace=self.workspace,
                 )
                 if not isinstance(result, dict):
                     result = {"error": "Tool returned an invalid result"}
-                status = "error" if result.get("error") or result.get("success") is False else "ok"
-                print(f">>> TOOL: {function['name']} [{status}]")
+                self.terminal.tool_finished(
+                    function["name"], result, time.monotonic() - tool_started_at
+                )
                 group.append(
                     {"role": "tool", "tool_call_id": call["id"], "content": _result_content(result)}
                 )
             groups.append(group)
+        self.terminal.max_steps_reached(max_steps)
         raise RuntimeError(
             f"Agent reached maximum step count ({max_steps}) without a final answer."
         )
 
 
 def main() -> None:
+    terminal = TerminalUI()
     try:
-        agent = OfflineGemmaAgent()
+        agent = OfflineGemmaAgent(terminal=terminal)
     except Exception as exc:
-        print("[STARTUP ERROR] " + redact(str(exc)))
+        terminal.error(str(exc), startup=True)
         return
-    print("Offline Gemma Agent — Windows CMD / read-only Jira")
-    print(f"Workspace: {WORKSPACE}\nType 'exit' to quit.")
+    terminal.show_banner(WORKSPACE, MODEL_PATH, agent.show_model_thoughts)
     while True:
         try:
-            user_message = input("You> ").strip()
+            user_message = input(terminal.prompt()).strip()
             if user_message.lower() in {"exit", "quit", "q"}:
                 break
             if user_message:
@@ -294,7 +312,7 @@ def main() -> None:
             print()
             break
         except Exception as exc:
-            print("[AGENT ERROR] " + redact(str(exc)))
+            terminal.error(str(exc))
 
 
 if __name__ == "__main__":

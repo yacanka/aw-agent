@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from agent import OfflineGemmaAgent
+from terminal_ui import TerminalUI
 
 
 def reply(content="", calls=None, finish="stop"):
@@ -124,3 +125,46 @@ class AgentLoopTests(unittest.TestCase):
                 _, model, _ = self.run_agent([reply(calls=[call()]), reply("Done")], executor)
             self.assertNotIn("test-session-value", json.dumps(model.history))
             self.assertNotIn("test-session-value", output.getvalue())
+
+    def test_terminal_shows_progress_thoughts_tool_summary_and_final_answer(self):
+        output = io.StringIO()
+        model = FakeModel(
+            [
+                reply(
+                    "<|channel>thought\nÖnce dosyaları kontrol et.<channel|>"
+                    '<|tool_call>call:list_files{directory:<|"|>.<|"|>}<tool_call|>'
+                ),
+                reply("<|channel>thought\nKanıt yeterli.<channel|>Bitti."),
+            ]
+        )
+        executor = mock.Mock(return_value={"directory": ".", "files": [{"name": "a.py"}]})
+        agent = OfflineGemmaAgent(
+            model,
+            executor,
+            terminal=TerminalUI(output),
+            show_model_thoughts=True,
+        )
+
+        result = agent.run("Inspect the workspace", max_steps=4)
+
+        rendered = output.getvalue()
+        self.assertEqual(result, "Bitti.")
+        self.assertIn("[ADIM 1/4]", rendered)
+        self.assertIn("Modelin düşüncesi", rendered)
+        self.assertIn("Önce dosyaları kontrol et.", rendered)
+        self.assertIn("[ARAÇ 1/1] Dosya listesi", rendered)
+        self.assertIn("[OK] 1 öğe bulundu.", rendered)
+        self.assertIn("[TAMAMLANDI] 2 adımda", rendered)
+        self.assertIn("[YANIT]\nBitti.", rendered)
+
+    def test_terminal_can_hide_model_thoughts(self):
+        output = io.StringIO()
+        agent = OfflineGemmaAgent(
+            FakeModel([reply("<|channel>thought\nGizli not.<channel|>Bitti.")]),
+            terminal=TerminalUI(output),
+            show_model_thoughts=False,
+        )
+
+        agent.run("Inspect the workspace")
+
+        self.assertNotIn("Gizli not", output.getvalue())
