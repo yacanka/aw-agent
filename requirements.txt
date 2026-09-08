@@ -1,0 +1,6 @@
+# Install the prebuilt wheel offline instead of downloading from PyPI.
+# Example:
+#   pip install --no-index --find-links=.\wheels llama-cpp-python
+#
+# The exact version should match the .whl file you downloaded.
+llama-cpp-python==0.3.35
