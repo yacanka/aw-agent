@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import time
@@ -8,13 +9,16 @@ from typing import Any, Callable
 
 from agent_tools import AVAILABLE_TOOL_NAMES, TOOL_DEFINITIONS, execute_tool
 from config import (
+    INFERENCE_TIMEOUT_SECONDS,
     MAX_AGENT_STEPS,
     MAX_TOKENS,
     MAX_UNKNOWN_TOOL_ATTEMPTS,
     MODEL_PATH,
+    N_BATCH,
     N_CTX,
     N_GPU_LAYERS,
     N_THREADS,
+    N_UBATCH,
     SHOW_MODEL_THOUGHTS,
     TEMPERATURE,
     VERBOSE_LLAMA,
@@ -28,6 +32,7 @@ from gemma_parser import (
     parse_gemma_tool_calls,
 )
 from jira_client import JIRA_CREATE_TOOLS
+from model_inference import complete_chat
 from settings import redact
 from terminal_ui import TerminalUI
 
@@ -85,6 +90,8 @@ def _build_llm() -> Any:
         return llama_cpp.Llama(
             model_path=str(MODEL_PATH),
             n_ctx=N_CTX,
+            n_batch=N_BATCH,
+            n_ubatch=N_UBATCH,
             n_threads=N_THREADS or max(1, (os.cpu_count() or 8) - 2),
             n_gpu_layers=N_GPU_LAYERS,
             verbose=VERBOSE_LLAMA,
@@ -200,6 +207,7 @@ class OfflineGemmaAgent:
         terminal: TerminalUI | None = None,
         show_model_thoughts: bool = SHOW_MODEL_THOUGHTS,
     ) -> None:
+        self._owns_llm = llm is None
         self.llm = llm if llm is not None else _build_llm()
         self.tool_executor = tool_executor
         self.workspace = workspace
@@ -255,6 +263,25 @@ class OfflineGemmaAgent:
     def reset_conversation(self) -> None:
         """Discard in-memory terminal history; no data is persisted to disk."""
         self._conversation.clear()
+        self._current_groups.clear()
+        self._create_results.clear()
+        self.close()
+
+    def close(self) -> None:
+        """Release an owned model; the next request reloads it. Injected models stay caller-owned."""
+        if not self._owns_llm or self.llm is None:
+            return
+        model, self.llm = self.llm, None
+        try:
+            model.close()
+        except Exception as exc:
+            # Cleanup must not replace the original inference/tool exception.
+            self.terminal.exception("model.close", exc)
+        finally:
+            del model
+            # The tokenizer holds a reference back to Llama. Collect that cycle
+            # before another model allocates its Python and native buffers.
+            gc.collect()
 
     def chat(self, user_message: str, max_steps: int = MAX_AGENT_STEPS) -> str:
         """Continue this instance's conversation, retaining confirmed results on failure."""
@@ -272,16 +299,27 @@ class OfflineGemmaAgent:
         self._create_results = {}
         answer = "Request interrupted. Check retained tool results before continuing."
         try:
+            if self.llm is None:
+                with self.terminal.operation("model.load"):
+                    # A previous failure's traceback may have kept the closed
+                    # model alive until after that turn's cleanup finished.
+                    gc.collect()
+                    self.llm = _build_llm()
             answer = self._run(user_message, max_steps)
             return answer
         finally:
-            if continuing:
-                self._repair_incomplete_groups()
-                turn = [{"role": "user", "content": redact(user_message)}]
-                turn.extend(message for group in self._current_groups for message in group)
-                turn.append({"role": "assistant", "content": answer})
-                self._conversation.append(_clean(turn))
-            self._active_history = []
+            try:
+                if continuing:
+                    self._repair_incomplete_groups()
+                    turn = [{"role": "user", "content": redact(user_message)}]
+                    turn.extend(message for group in self._current_groups for message in group)
+                    turn.append({"role": "assistant", "content": answer})
+                    self._conversation.append(_clean(turn))
+            finally:
+                self._active_history = []
+                self._current_groups = []
+                self._create_results.clear()
+                self.close()
 
     def _repair_incomplete_groups(self) -> None:
         # An interrupted batch must not leave unmatched tool calls in the next prompt.
@@ -345,13 +383,21 @@ class OfflineGemmaAgent:
             with self.terminal.operation(f"step={step} context.prepare"):
                 messages = self._messages(initial, groups)
             with self.terminal.operation(f"step={step} model.inference"):
-                response = self.llm.create_chat_completion(
+                response = complete_chat(
+                    self.llm,
+                    self.terminal,
+                    step,
+                    INFERENCE_TIMEOUT_SECONDS,
                     messages=messages,
                     tools=TOOL_DEFINITIONS,
                     tool_choice="auto",
                     temperature=TEMPERATURE,
                     max_tokens=self.max_tokens,
                 )
+            retry_instruction = (
+                "Correct the response using only the provided tools and their schemas. "
+                "Return a nonempty final answer only when supported by evidence."
+            )
             try:
                 choice = response["choices"][0]
                 message = choice["message"]
@@ -364,7 +410,20 @@ class OfflineGemmaAgent:
                         "usage": response.get("usage"),
                     },
                 )
-                if not isinstance(content, str) or choice.get("finish_reason") == "length":
+                if choice.get("finish_reason") == "length":
+                    retry_instruction = (
+                        "The previous response exhausted the output token budget. "
+                        "Produce a shorter response with minimal reasoning. Use the confirmed "
+                        "tool results already in this conversation. Do not repeat successful tool calls. "
+                        "If the task is complete, return a concise evidence-based final answer. "
+                        "If information is still missing, request only the necessary data. "
+                        "For long lists, use compact entries without extra descriptions."
+                    )
+                    raise ValueError(
+                        f"Model output reached the {self.max_tokens} token limit; "
+                        "partial output discarded. Retrying with a shorter response."
+                    )
+                if not isinstance(content, str) or choice.get("finish_reason") == "incomplete":
                     raise ValueError("Incomplete model output")
                 calls = _validated_calls(message, content)
                 if not calls and not extract_visible_content(content):
@@ -392,7 +451,7 @@ class OfflineGemmaAgent:
                         },
                         {
                             "role": "user",
-                            "content": "Correct the response using only the provided tools and their schemas. Return a nonempty final answer only when supported by evidence.",
+                            "content": retry_instruction,
                         },
                     ]
                 )
@@ -447,22 +506,25 @@ def main() -> None:
     except Exception as exc:
         terminal.error(str(exc), startup=True)
         return
-    terminal.show_banner(WORKSPACE, MODEL_PATH, agent.show_model_thoughts)
-    while True:
-        try:
-            user_message = input(terminal.prompt()).strip()
-            if user_message.lower() in {"exit", "quit", "q"}:
+    try:
+        terminal.show_banner(WORKSPACE, MODEL_PATH, agent.show_model_thoughts)
+        while True:
+            try:
+                user_message = input(terminal.prompt()).strip()
+                if user_message.lower() in {"exit", "quit", "q"}:
+                    break
+                if user_message == "/reset":
+                    agent.reset_conversation()
+                    print("Konuşma geçmişi temizlendi.")
+                elif user_message:
+                    agent.chat(user_message)
+            except (EOFError, KeyboardInterrupt):
+                print()
                 break
-            if user_message == "/reset":
-                agent.reset_conversation()
-                print("Konuşma geçmişi temizlendi.")
-            elif user_message:
-                agent.chat(user_message)
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        except Exception as exc:
-            terminal.error(str(exc))
+            except Exception as exc:
+                terminal.error(str(exc))
+    finally:
+        agent.close()
 
 
 if __name__ == "__main__":

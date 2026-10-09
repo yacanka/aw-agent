@@ -31,6 +31,10 @@ WORKSPACE = Path(_values.get("GEMMA_AGENT_WORKSPACE", str(BASE_DIR / "workspace"
 if WORKSPACE == BASE_DIR or WORKSPACE in BASE_DIR.parents:
     raise ValueError("Workspace must not contain the application directory and .env")
 N_CTX = _integer("GEMMA_N_CTX", 16384, 512)
+N_BATCH = _integer("GEMMA_N_BATCH", 128, 1)
+N_UBATCH = _integer("GEMMA_N_UBATCH", 64, 1)
+if N_UBATCH > N_BATCH or N_BATCH > N_CTX:
+    raise ValueError("GEMMA_N_UBATCH <= GEMMA_N_BATCH <= GEMMA_N_CTX is required")
 N_GPU_LAYERS = _integer("GEMMA_N_GPU_LAYERS", -1, -1)
 N_THREADS = _integer("GEMMA_N_THREADS", 0, 0)
 MAX_TOKENS = _integer("GEMMA_MAX_TOKENS", 2048, 1)
@@ -42,6 +46,7 @@ except ValueError:
     raise ValueError("GEMMA_TEMPERATURE must be a number") from None
 if not math.isfinite(TEMPERATURE) or not 0 <= TEMPERATURE <= 2:
     raise ValueError("GEMMA_TEMPERATURE must be between 0 and 2")
+INFERENCE_TIMEOUT_SECONDS = _integer("GEMMA_INFERENCE_TIMEOUT_SECONDS", 300, 1)
 MAX_AGENT_STEPS = _integer("GEMMA_MAX_AGENT_STEPS", 15, 1)
 MAX_UNKNOWN_TOOL_ATTEMPTS = _integer("GEMMA_MAX_UNKNOWN_TOOL_ATTEMPTS", 3, 1)
 VERBOSE_LLAMA = _boolean("GEMMA_VERBOSE_LLAMA", False)

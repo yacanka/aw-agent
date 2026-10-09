@@ -208,6 +208,28 @@ aktarılır. Referans artık bağlamda değilse ajan kullanıcıya sorar.
 Programatik run() bağımsız kalır; chat() konuşmayı sürdürür ve
 reset_conversation() bellekteki konuşmayı temizler.
 
+Model kaynakları görev sonunda (başarı, hata veya Ctrl+C) açıkça kapatılır;
+sonraki mesajda model yeniden yüklenir. Aynı görevin araç/model adımları tek
+modeli paylaşır. Konuşma geçmişi ve doğrulanmış Jira sonuçları korunur;
+başarısız görev otomatik tekrarlanmaz. Yeniden yükleme görev başına gecikme
+ekler, ancak önceki görevin native kaynaklarının sonraki göreve taşınmasını
+önler. /reset ve terminalden çıkış da yüklü modeli kapatır. Programatik
+close() aynı temizliği yapar; dışarıdan llm= ile verilen modelin yaşam
+döngüsü çağırana aittir ve ajan bu modeli kapatmaz.
+
+GEMMA_N_BATCH=128 ve GEMMA_N_UBATCH=64 varsayılanları prompt işleme
+tamponlarının bellek ihtiyacını azaltır; prompt işleme yavaşlayabilir.
+1 <= GEMMA_N_UBATCH <= GEMMA_N_BATCH <= GEMMA_N_CTX olmalıdır.
+Mevcut .env dosyasına bu ayarların eklenmesi zorunlu değildir; eksikse
+varsayılanlar kullanılır. Değişiklikleri almak için ajanı yeniden başlatın.
+ErrorOutOfDeviceMemory GPU belleği ayırmanın başarısız olduğunu belirtir;
+tek başına Python RAM sızıntısını kanıtlamaz. Tek bir görev bile sığmıyorsa
+GEMMA_N_GPU_LAYERS değerini azaltın (0 açıkça CPU seçer) veya GEMMA_N_CTX
+değerini düşürün; bağlamı düşürmek uzun görev/geçmiş kapasitesini azaltır.
+Model yükleri ve bağlam donanım belleğine sığmalıdır; yeniden yükleme bunu
+garanti etmez. Native çağrı tamamen kilitlenirse Python finally bloğuna
+dönemez; bu durumda süreç yeniden başlatılmalıdır.
+
 Terminal varsayılan olarak geliştirici odaklı DEBUG ayrıntılarını gösterir:
     - Zaman damgası, adım, gerçek araç adı ve çağrı kimliği.
     - Komut, parametreler, stdin, çalışma dizini ve gönderilen timeout.
@@ -224,6 +246,19 @@ aşarsa başlangıç ve son korunur, atlanan karakter sayısı açıkça belirti
 Alt süreç ve dosya araçlarının mevcut çıktı limitleri ayrıca geçerlidir.
 Modelin thought blokları varsayılan görünür; GEMMA_SHOW_THOUGHTS=0 bunları
 kapatır. Düşünceler model yanıtı tamamlandıktan sonra gösterilir.
+Çıkarım sırasında her 5 saniyede WAIT model.inference kaydı görünür:
+geçen süre, alınan yanıt parçası sayısı ve son parçadan beri geçen süre.
+Parça sayısı token sayısı değildir; model şablonu yanıtı tamponlayabilir.
+GEMMA_INFERENCE_TIMEOUT_SECONDS varsayılan 300 saniyedir. Süre aşımında
+kısmi yanıt/araç çağrıları kullanılmaz ve otomatik tekrar yapılmaz; chat()
+önceki doğrulanmış araç sonuçlarını korur. Sınır model kontrolü Python'a
+verdiğinde uygulanır. Native GPU/sürücü çağrısı kilitlenirse zorla kesilemez;
+WAIT kaydı bunu belirtir. Ctrl+C yanıt vermiyorsa süreç kapatılmalıdır.
+finish_reason=length, modelin yanıtı bitiremeden çıktı token sınırına ulaştığını
+belirtir. Bu durum araç şeması hatasından ayrı raporlanır; tekrar denemesinde
+eldeki sonuçlarla daha kısa yanıt istenir. Yarım araç çağrıları çalıştırılmaz.
+Yavaş donanımda sınır artırılabilir. GEMMA_VERBOSE_LLAMA=1 backend
+ayrıntılarını açar; bu loglar hedef makinedeki teşhise yardımcı olur.
 Bilinen oturum değerleri, kimlik doğrulama başlıkları ve yaygın parola/token
 alanları maskelenir; terminal kontrol karakterleri kaçış biçiminde gösterilir.
 Kaynak kod satırları, yerel değişkenler ve tüm ortam değişkenleri hata stack'ine
@@ -269,6 +304,11 @@ Windows kabul:
 5. .env oturumu yenilenince bir sonraki Jira isteği yeni değeri kullanmalı.
 6. Kurumsal ekip PowerShell/ağ politikasının alt süreçlere de uygulandığını
    doğrulamalı; testler PowerShell'i gerçekten başlatmayı denemez.
+7. Aynı terminalde en az 20 ardışık görev verin; Görev Yöneticisi'nde görev
+   bitimindeki RAM, ayrılmış/paylaşılan GPU belleği ve tepe değerlerini izleyin.
+   Görev sonlarında sürekli büyüme olmamalı. Uzun Jira çıktısı, takip mesajı,
+   /reset ve hata sonrası yeni görev senaryolarını da kontrol edin. Birim
+   testler kaynak yaşam döngüsünü doğrular; gerçek VRAM ölçümü yerine geçmez.
 
 Statik kontroller (Ruff geliştirme aracı; runtime bağımlılığı değildir):
     ruff check .

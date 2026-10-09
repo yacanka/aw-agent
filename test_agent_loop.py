@@ -77,6 +77,25 @@ class AgentLoopTests(unittest.TestCase):
                 executor.assert_not_called()
                 self.assertTrue(result)
 
+    def test_token_limit_reports_cause_and_retains_evidence_without_partial_calls(self):
+        output = io.StringIO()
+        result, model, executor = self.run_agent(
+            [
+                reply(calls=[call()]),
+                reply("discarded partial output", calls=[call()], finish="length"),
+                reply("Inspected."),
+            ],
+            terminal=TerminalUI(output),
+        )
+        self.assertEqual(result, "Inspected.")
+        executor.assert_called_once()
+        self.assertIn("Model output reached the 2048 token limit", output.getvalue())
+        retry = model.history[-1]
+        self.assertTrue(any(message["role"] == "tool" for message in retry))
+        self.assertNotIn("discarded partial output", json.dumps(retry))
+        self.assertIn("shorter response", retry[-1]["content"])
+        self.assertIn("Do not repeat successful tool calls", retry[-1]["content"])
+
     def test_invalid_limit_and_counter_reset(self):
         with self.assertRaisesRegex(RuntimeError, "consecutive"):
             self.run_agent([reply(""), reply(""), reply("")])
