@@ -2,12 +2,61 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 import textwrap
+import time
+import traceback
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
 from settings import redact
+
+DEBUG_BLOCK_LIMIT = 20000
+_SECRET_KEY = re.compile(
+    r"(?i)(?:^|[_-])(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|jsessionid)$"
+)
+
+
+def _debug_text(text: str) -> str:
+    # Redact before truncation/JSON escaping so a split credential cannot leak.
+    text = redact(text)
+    text = re.sub(
+        r'''(?im)(\b(?:password|passwd|secret|[\w-]*token|api[_-]?key|authorization|cookie|jsessionid)'''
+        r'''\b["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)''',
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r'''(?i)(--(?:password|passwd|secret|token|api-key)\s+)("[^"]*"|'[^']*'|\S+)''',
+        r"\1[REDACTED]",
+        text,
+    )
+    # Untrusted process/model output must not erase or rewrite the terminal log.
+    return re.sub(
+        r"[\x00-\x08\x0b-\x1f\x7f-\x9f]",
+        lambda match: f"\\x{ord(match[0]):02x}",
+        text,
+    )
+
+
+def _debug_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            _debug_text(str(key)): (
+                "[REDACTED]" if _SECRET_KEY.search(str(key)) else _debug_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_debug_value(item) for item in value]
+    if isinstance(value, str):
+        return _debug_text(value)
+    return value
+
 
 _TOOL_NAMES = {
     "list_files": "Dosya listesi",
@@ -22,7 +71,7 @@ _TOOL_NAMES = {
 
 
 def _short_text(value: Any, limit: int = 180) -> str:
-    text = " ".join(redact(str(value)).split())
+    text = " ".join(_debug_text(str(value)).split())
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
@@ -69,9 +118,7 @@ def _result_summary(name: str, result: dict[str, Any]) -> str:
         stderr_size = len(str(result.get("stderr", "")))
         details = f"Çıkış kodu: {exit_code}"
         if stdout_size or stderr_size:
-            details += (
-                f", çıktı: {stdout_size} karakter, hata çıktısı: {stderr_size} karakter"
-            )
+            details += f", çıktı: {stdout_size} karakter, hata çıktısı: {stderr_size} karakter"
         return details + "."
     if name == "jira_search":
         count = len(result.get("issues") or [])
@@ -88,17 +135,48 @@ def _result_summary(name: str, result: dict[str, Any]) -> str:
 
 
 class TerminalUI:
-    """Render progress without exposing raw tool payloads or credentials."""
+    """Render developer diagnostics with redaction and bounded payload blocks."""
 
     def __init__(self, stream: TextIO | None = None) -> None:
         self.stream = stream
 
     def _write(self, text: str = "") -> None:
-        print(text, file=self.stream or sys.stdout, flush=True)
+        print(_debug_text(text), file=self.stream or sys.stdout, flush=True)
 
-    def show_banner(
-        self, workspace: Path, model_path: Path, thoughts_enabled: bool
-    ) -> None:
+    def debug(self, event: str, details: Any) -> None:
+        self._write(f"[{datetime.now().astimezone().isoformat(timespec='milliseconds')}] {event}")
+        safe = _debug_value(details)
+        text = safe if isinstance(safe, str) else json.dumps(safe, ensure_ascii=False, indent=2)
+        if len(text) > DEBUG_BLOCK_LIMIT:
+            half = DEBUG_BLOCK_LIMIT // 2
+            omitted = len(text) - DEBUG_BLOCK_LIMIT
+            text = text[:half] + f"\n... [LOG TRUNCATED: {omitted} karakter] ...\n" + text[-half:]
+        self._write("\n".join(f"        | {line}" for line in text.splitlines() or ["<empty>"]))
+
+    def exception(self, stage: str, exc: Exception) -> None:
+        # Stack locations are useful; source lines and locals may contain credentials.
+        frames = [
+            f"{frame.filename}:{frame.lineno} in {frame.name}"
+            for frame in traceback.extract_tb(exc.__traceback__)
+        ]
+        self.debug(
+            f"ERROR {stage}",
+            {"exception_type": type(exc).__name__, "message": str(exc), "stack": frames},
+        )
+
+    @contextmanager
+    def operation(self, stage: str):
+        started = time.monotonic()
+        self.debug(f"START {stage}", {})
+        try:
+            yield
+        except Exception as exc:
+            self.exception(stage, exc)
+            raise
+        else:
+            self.debug(f"DONE {stage}", {"duration_seconds": round(time.monotonic() - started, 3)})
+
+    def show_banner(self, workspace: Path, model_path: Path, thoughts_enabled: bool) -> None:
         self._write("=" * 64)
         self._write(" Yerel Gemma Kodlama Ajanı")
         self._write("=" * 64)
@@ -106,6 +184,7 @@ class TerminalUI:
         self._write(f"Model          : {model_path.name}")
         state = "açık" if thoughts_enabled else "kapalı"
         self._write(f"Model düşüncesi: {state}")
+        self._write("Log seviyesi   : DEBUG (parametreler, sonuçlar ve hata ayrıntıları)")
         self._write("Çıkmak için: exit, quit veya q")
         self._write()
 
@@ -121,9 +200,7 @@ class TerminalUI:
 
     def invalid_response(self, attempt: int, limit: int) -> None:
         if attempt >= limit:
-            self._write(
-                f"[HATA] Model {limit} kez geçersiz yanıt verdi; süreç durduruluyor."
-            )
+            self._write(f"[HATA] Model {limit} kez geçersiz yanıt verdi; süreç durduruluyor.")
             return
         self._write(f"[UYARI] Model yanıtı geçersiz; düzeltiliyor ({attempt}/{limit}).")
 
@@ -132,7 +209,7 @@ class TerminalUI:
             return
         self._write("[MODEL] Modelin düşüncesi:")
         for thought in thoughts:
-            safe = redact(thought).strip()
+            safe = _debug_text(thought).strip()
             if not safe:
                 continue
             for line in safe.splitlines():
@@ -144,17 +221,38 @@ class TerminalUI:
         self._write(f"[PLAN] Model {count} araç işlemi seçti.")
 
     def tool_started(
-        self, index: int, total: int, name: str, arguments: dict[str, Any]
+        self, index: int, total: int, name: str, arguments: dict[str, Any], call_id: str = ""
     ) -> None:
         label = _TOOL_NAMES.get(name, name)
         self._write(f"[ARAÇ {index}/{total}] {label}")
         self._write(f"        {_tool_action(name, arguments)}")
+        self.debug(f"TOOL CALL {name} {call_id}", {"arguments": arguments})
 
-    def tool_finished(self, name: str, result: dict[str, Any], duration: float) -> None:
-        failed = bool(result.get("error") or result.get("success") is False)
+    def tool_finished(
+        self, name: str, result: dict[str, Any], duration: float, call_id: str = ""
+    ) -> None:
+        failed = bool(
+            result.get("error")
+            or result.get("success") is False
+            or result.get("timed_out")
+            or result.get("exit_code") not in (None, 0)
+        )
         status = "HATA" if failed else "OK"
-        summary = _result_summary(name, result)
+        try:
+            summary = _result_summary(name, result)
+        except (TypeError, AttributeError):
+            summary = "Araç sonucunun alanları beklenen biçimde değil; ayrıntılar aşağıda."
         self._write(f"        [{status}] {summary} ({duration:.1f} sn)")
+        context = f"{name} {call_id}"
+        metadata = {
+            key: value
+            for key, value in result.items()
+            if key not in {"stdout", "stderr", "content"}
+        }
+        self.debug(f"TOOL RESULT {status} {context}", metadata)
+        for key in ("stdout", "stderr", "content"):
+            if key in result:
+                self.debug(f"{key.upper()} {context}", result[key])
 
     def final_answer(self, answer: str, step: int, duration: float) -> None:
         self._write()

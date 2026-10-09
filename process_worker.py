@@ -30,8 +30,15 @@ def main() -> int:
                     command_line = '"' + argv[0] + '" /d /s /c ' + argv[4]
                     return subprocess.call(command_line, executable=argv[0], shell=False)
                 return subprocess.call(argv, shell=False)
-            except OSError:
-                print("Target process could not be started", file=sys.stderr)
+            except OSError as exc:
+                # Do not expose raw exception text, which can contain paths
+                # or command arguments. Codes retain actionable OS diagnostics.
+                print(
+                    "Target process could not be started: "
+                    f"stage=process.target.spawn type={type(exc).__name__} "
+                    f"errno={exc.errno} winerror={getattr(exc, 'winerror', None)}",
+                    file=sys.stderr,
+                )
                 return 126
         line.extend(character)
     return 125

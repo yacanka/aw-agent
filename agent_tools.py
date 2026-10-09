@@ -14,7 +14,7 @@ from config import (
     COMMAND_TIMEOUT_SECONDS,
     FILE_MAX_BYTES,
 )
-from jira_client import JIRA_TOOL_DEFINITIONS, execute_jira
+from jira_client import JIRA_TOOL_DEFINITIONS, JIRA_TOOL_NAMES, execute_jira
 from process_runner import run_process as _run_process
 from settings import redact
 from windows_job import system_cmd
@@ -207,7 +207,9 @@ def _validate_cmd_command(command: str) -> str:
 
     if "\x00" in command or command.count('"') % 2:
         raise PermissionError("NUL and unbalanced quotes are blocked")
-    if re.search(r"(?i)(?:^|[^a-z0-9_])(?:powershell|pwsh|cmd)(?:\.exe)?(?:$|[^a-z0-9_])", command):
+    executable = _first_command_token(command)
+    # Shell names in script filenames or string arguments are data, not commands.
+    if re.fullmatch(r"(?i)(?:powershell|pwsh|cmd)(?:\.exe)?", executable):
         raise PermissionError("Nested shells and PowerShell are blocked")
     if re.search(r"(?i)\.(?:bat|cmd)(?:$|[\s\"'])", command):
         raise PermissionError("Batch scripts are blocked")
@@ -219,8 +221,6 @@ def _validate_cmd_command(command: str) -> str:
         raise PermissionError("Root-relative Windows paths are blocked")
     if re.search(r"""(?:^|[\s=])["']?/[^/\s"']+/""", command):
         raise PermissionError("Absolute slash paths are blocked")
-
-    executable = _first_command_token(command)
 
     if "\\" in executable or "/" in executable or ":" in executable:
         raise PermissionError(
@@ -282,7 +282,7 @@ def _resolved_cmd(command: str, workspace: Path) -> str:
                 executable = candidate
                 break
         if executable is None:
-            raise ValueError("Allowlisted executable not found outside workspace")
+            raise ValueError(f"{filename} not found on PATH outside workspace")
     if any(character in str(executable) for character in '&|<>^%!\r\n"'):
         raise ValueError("Executable path contains unsupported CMD characters")
     # /s strips the outer pair while preserving the executable/argument quotes.
@@ -319,19 +319,22 @@ def run_command(
     try:
         comspec = system_cmd()
         resolved_command = _resolved_cmd(command, workspace)
-    except (OSError, ValueError):
-        return {"error": "Verified system cmd.exe or allowlisted executable is unavailable"}
+    except (OSError, ValueError) as exc:
+        return {
+            "error": "Verified system cmd.exe or allowlisted executable is unavailable",
+            "error_stage": "process.resolve",
+            "exception_type": type(exc).__name__,
+            "exception_message": redact(str(exc)),
+        }
 
+    is_python = _first_command_token(command).lower() in {"python", "python.exe", "py", "py.exe"}
     result = _run_process(
         [comspec, "/d", "/s", "/c", resolved_command],
         cwd=cwd,
         stdin_text=stdin,
         timeout_seconds=timeout,
-        output_encoding=(
-            "utf-8"
-            if _first_command_token(command).lower() in {"python", "python.exe"}
-            else _cmd_output_encoding()
-        ),
+        output_encoding="utf-8" if is_python else _cmd_output_encoding(),
+        python_utf8=is_python,
     )
     result.update(
         {
@@ -385,6 +388,7 @@ def run_python(
         cwd=cwd,
         stdin_text=stdin,
         timeout_seconds=timeout,
+        python_utf8=True,
     )
     result.update(
         {
@@ -546,7 +550,7 @@ def execute_tool(
 ) -> dict[str, Any]:
     """Central dispatcher shared by structured and native Gemma calls."""
     try:
-        if name in {"jira_search", "jira_get_issue", "jira_get_comments"}:
+        if name in JIRA_TOOL_NAMES:
             return execute_jira(name, arguments)
 
         if name == "list_files":

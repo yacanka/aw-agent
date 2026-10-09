@@ -132,7 +132,7 @@ class JiraTests(unittest.TestCase):
         for url in (
             "http://jira.example.com",
             "https://user:pass@jira.example.com",
-            "https://jira.example.com/path",
+            "https://jira.example.com/../path",
             "https://jira.example.com#other",
         ):
             self.settings["JIRA_BASE_URL"] = url

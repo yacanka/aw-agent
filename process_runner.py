@@ -66,6 +66,7 @@ def run_process(
     stdin_text: str | None,
     timeout_seconds: int,
     output_encoding: str = "utf-8",
+    python_utf8: bool = False,
 ) -> dict[str, Any]:
     if stdin_text is not None and not isinstance(stdin_text, str):
         return {"success": False, "error": "stdin must be a string"}
@@ -77,24 +78,33 @@ def run_process(
     timed_out = False
     stdout = OutputBuffer(COMMAND_MAX_OUTPUT_CHARS)
     stderr = OutputBuffer(COMMAND_MAX_OUTPUT_CHARS)
+    stage = "process.job.create"
     try:
         if IS_WINDOWS:
             job = WindowsJob()
         worker = Path(__file__).with_name("process_worker.py")
+        environment = child_environment()
+        if python_utf8:
+            # Apply to launcher-selected interpreters too, without rewriting
+            # py's version selectors. Override inherited pipe encodings.
+            environment.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+        stage = "process.spawn"
         process = subprocess.Popen(
             [sys.executable, "-I", str(worker)],
             cwd=str(cwd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=child_environment(),
+            env=environment,
             shell=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0,
             start_new_session=not IS_WINDOWS,
         )
         if job:
             # No target argv is released until assignment succeeds.
+            stage = "process.job.assign"
             job.assign(process.pid)
+        stage = "process.io"
         data = (json.dumps(list(argv)) + "\n").encode("utf-8")
         data += (stdin_text or "").encode(output_encoding, errors="replace")
         for function, arguments in (
@@ -106,13 +116,19 @@ def run_process(
             threads.append(thread)
             thread.start()
         try:
+            stage = "process.wait"
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-    except OSError:
+    except OSError as exc:
         return {
             "success": False,
             "error": "Process containment or startup failed; target was not released",
+            "error_stage": stage,
+            "exception_type": type(exc).__name__,
+            "exception_message": redact(str(exc)),
+            "errno": exc.errno,
+            "winerror": getattr(exc, "winerror", None),
         }
     finally:
         if job:
@@ -145,4 +161,5 @@ def run_process(
     }
     if timed_out:
         result["error"] = f"Command timed out after {timeout_seconds} seconds"
+        result["error_stage"] = "process.wait"
     return result

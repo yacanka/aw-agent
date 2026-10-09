@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,27 @@ class ProcessTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["exit_code"], 7)
 
+    def test_python_utf8_overrides_inherited_stdio_encoding(self):
+        with mock.patch.dict(os.environ, {"PYTHONIOENCODING": "ascii", "PYTHONUTF8": "0"}):
+            result = self.run_script("print(input())\n", stdin="Yaşar\n")
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["stdout"].strip(), "Yaşar")
+
+    def test_target_startup_error_preserves_codes_without_raw_message(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = run_process([str(Path(temporary) / "missing.exe")], Path(temporary), None, 1)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["exit_code"], 126)
+        self.assertIn("process.target.spawn", result["stderr"])
+        self.assertIn("FileNotFoundError", result["stderr"])
+        self.assertIn("errno=2", result["stderr"])
+        self.assertNotIn(temporary, result["stderr"])
+
+    def test_shell_names_in_python_data_are_accepted(self):
+        for command in ('python -c "print(\'cmd\')"', "python cmd.py", "python -c powershell"):
+            with self.subTest(command=command):
+                self.assertEqual(_validate_cmd_command(command), command)
+
     def test_stdin_unicode_and_secret_environment(self):
         with mock.patch.dict(os.environ, {"JIRA_JSESSIONID": "test-only-session"}):
             result = self.run_script(
@@ -50,6 +72,7 @@ class ProcessTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIsNone(result["exit_code"])
         self.assertIn("started", result["stdout"])
+        self.assertEqual(result["error_stage"], "process.wait")
 
     def test_job_creation_failure_does_not_spawn(self):
         with (
@@ -60,6 +83,8 @@ class ProcessTests(unittest.TestCase):
             result = run_process(["python", "script.py"], Path("."), None, 1)
         spawn.assert_not_called()
         self.assertFalse(result["success"])
+        self.assertEqual(result["error_stage"], "process.job.create")
+        self.assertEqual(result["exception_type"], "OSError")
 
     def test_assignment_failure_never_releases_target(self):
         job = mock.Mock()
@@ -76,6 +101,22 @@ class ProcessTests(unittest.TestCase):
         process.stdin.write.assert_not_called()
         job.close.assert_called_once()
         self.assertFalse(result["success"])
+        self.assertEqual(result["error_stage"], "process.job.assign")
+
+    def test_spawn_error_preserves_os_diagnostics_and_redacts_session(self):
+        with (
+            mock.patch("process_runner.IS_WINDOWS", False),
+            mock.patch.dict(os.environ, {"JIRA_JSESSIONID": "synthetic-session"}),
+            mock.patch(
+                "process_runner.subprocess.Popen",
+                side_effect=PermissionError(13, "denied synthetic-session"),
+            ),
+        ):
+            result = run_process(["python", "script.py"], Path("."), None, 1)
+        self.assertEqual(result["error_stage"], "process.spawn")
+        self.assertEqual(result["exception_type"], "PermissionError")
+        self.assertEqual(result["errno"], 13)
+        self.assertNotIn("synthetic-session", str(result))
 
     def test_workspace_program_cannot_shadow_allowlisted_executable(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -104,7 +145,7 @@ class ProcessTests(unittest.TestCase):
             "powershell Get-Item .",
             "pwsh -c test",
             "cmd /c dir",
-            "python -c powershell",
+            '"cmd.exe" /c dir',
             "git status | more",
             "python ../outside.py",
             r"python ..\outside.py",
@@ -120,6 +161,52 @@ class ProcessTests(unittest.TestCase):
             with self.subTest(command=command):
                 with self.assertRaises(PermissionError):
                     _validate_cmd_command(command)
+
+    def test_shell_executable_is_blocked_even_if_allowlisted(self):
+        with mock.patch("agent_tools.COMMAND_ALLOWED_PROGRAMS", ("cmd.exe",)):
+            with self.assertRaisesRegex(PermissionError, "shell"):
+                _validate_cmd_command("cmd.exe /c dir")
+
+    def test_py_resolution_preserves_version_selector(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            launcher = root / "py.exe"
+            launcher.write_bytes(b"not executed")
+            with mock.patch.dict(os.environ, {"PATH": str(root)}):
+                command = _resolved_cmd('py -3 "hello world.py"', workspace)
+        self.assertEqual(command, f'""{launcher.resolve()}" -3 "hello world.py""')
+
+    def test_missing_launcher_reports_resolution_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                mock.patch("agent_tools.IS_WINDOWS", True),
+                mock.patch("agent_tools.system_cmd", return_value=r"C:\Windows\System32\cmd.exe"),
+                mock.patch.dict(os.environ, {"PATH": ""}),
+            ):
+                result = run_command(Path(temporary), "py -3 script.py")
+        self.assertEqual(result["error_stage"], "process.resolve")
+        self.assertIn("py.exe", result["exception_message"])
+        self.assertIn("PATH", result["exception_message"])
+
+    @unittest.skipUnless(os.name == "nt", "Requires real Windows CMD")
+    def test_py_command_uses_utf8_for_stdin_and_stdout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            (workspace / "script.py").write_text("print(input())\n", encoding="utf-8")
+            # Substitute only executable discovery so this exercises real CMD
+            # pipes and encoding without requiring an installed py launcher.
+            with (
+                mock.patch(
+                    "agent_tools._resolved_cmd",
+                    return_value=f'""{sys.executable}" script.py"',
+                ),
+                mock.patch.dict(os.environ, {"PYTHONIOENCODING": "ascii", "PYTHONUTF8": "0"}),
+            ):
+                result = run_command(workspace, "py script.py", stdin="Yaşar\n")
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["stdout"].strip(), "Yaşar")
 
     @unittest.skipUnless(os.name == "nt", "Requires real Windows CMD and Job Objects")
     def test_real_cmd_ignores_comspec(self):

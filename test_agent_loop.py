@@ -121,10 +121,41 @@ class AgentLoopTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"JIRA_JSESSIONID": "test-session-value"}):
             executor = mock.Mock(return_value={"description": "test-session-value"})
             output = io.StringIO()
-            with redirect_stdout(output):
-                _, model, _ = self.run_agent([reply(calls=[call()]), reply("Done")], executor)
+            _, model, _ = self.run_agent(
+                [reply(calls=[call()]), reply("Done")], executor, terminal=TerminalUI(output)
+            )
             self.assertNotIn("test-session-value", json.dumps(model.history))
             self.assertNotIn("test-session-value", output.getvalue())
+            self.assertIn("TOOL RESULT", output.getvalue())
+
+    def test_validation_error_identifies_tool_parameter_and_retry(self):
+        output = io.StringIO()
+        _, _, executor = self.run_agent(
+            [reply(calls=[call("list_files", {"directory": 42})]), reply("Recovered")],
+            terminal=TerminalUI(output),
+        )
+        executor.assert_not_called()
+        rendered = output.getvalue()
+        self.assertIn("step=1 model.validate", rendered)
+        self.assertIn("list_files.directory: Expected string, received int", rendered)
+        self.assertIn("(1/3)", rendered)
+
+    def test_tool_exception_reports_stage_and_does_not_disappear(self):
+        output = io.StringIO()
+        executor = mock.Mock(side_effect=OSError("synthetic execution failure"))
+        with self.assertRaisesRegex(OSError, "synthetic execution failure"):
+            self.run_agent([reply(calls=[call()])], executor, terminal=TerminalUI(output))
+        self.assertIn("ERROR step=1 tool.execute list_files call_", output.getvalue())
+        self.assertNotIn("[TAMAMLANDI]", output.getvalue())
+
+    def test_inference_exception_reports_stage(self):
+        output = io.StringIO()
+        model = FakeModel([])
+        model.create_chat_completion = mock.Mock(side_effect=RuntimeError("inference failed"))
+        agent = OfflineGemmaAgent(model, terminal=TerminalUI(output))
+        with self.assertRaisesRegex(RuntimeError, "inference failed"):
+            agent.run("Inspect")
+        self.assertIn("ERROR step=1 model.inference", output.getvalue())
 
     def test_terminal_shows_progress_thoughts_tool_summary_and_final_answer(self):
         output = io.StringIO()
